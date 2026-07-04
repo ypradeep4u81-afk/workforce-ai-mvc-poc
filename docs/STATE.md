@@ -167,3 +167,41 @@ Kafka record key (`EMP99`) matches `outbox_events.aggregate_id`; record value is
 - ℹ️ Infra containers were already running at session start (~1hr uptime) — this session did not perform a fresh `docker compose up`; reachability was still independently re-verified via `nc` and direct queries rather than assumed.
 
 **Action needed before Session 5**: delete/fix the two leftover `workforce_ai_mvc_poc`-package files so `mvn clean install` passes cleanly, per SPEC.md's "run a full mvn clean install and confirm it's clean before calling any milestone done" requirement.
+
+## Post-cleanup verification
+Date: 2026-07-04. Cleanup-only session, scoped exactly to the build failure documented above. No config, ports, or application logic touched.
+
+### What was confirmed before deleting
+- `grep -rn "workforce_ai_mvc_poc.domain.ShiftAssignment\|import workforce_ai_mvc_poc"` across all `.java` files (excluding `target/`) returned **zero matches** outside the two stray files themselves — confirmed `workforce_ai_mvc_poc.domain.ShiftAssignment` was truly unreferenced dead code, not silently relied on elsewhere.
+- `find src/test -iname "*.java"` showed `WorkforceAiMvcPocApplicationTests.java` was the **only** test file in the repo — so deleting it without replacement would drop test coverage to zero. A minimal replacement was required, not optional.
+
+### What was deleted
+- `src/test/java/workforce_ai_mvc_poc/WorkforceAiMvcPocApplicationTests.java` (leftover pre-consolidation test, wrong package for `@SpringBootConfiguration` discovery)
+- `src/main/java/workforce_ai_mvc_poc/domain/ShiftAssignment.java` (unreferenced duplicate of `com.wfm.poc.domain.ShiftAssignment`)
+- The now-empty leftover directories: `src/test/java/workforce_ai_mvc_poc/`, `src/main/java/workforce_ai_mvc_poc/domain/`, `src/main/java/workforce_ai_mvc_poc/`
+
+### What was added
+- `src/test/java/com/wfm/poc/WorkforceAiMvcPocApplicationTests.java` — minimal `@SpringBootTest` context-load smoke test (`contextLoads()`), identical in intent to the deleted one but in the correct package (`com.wfm.poc`) so Spring Boot's upward package search finds `com.wfm.poc.WorkforceAiMvcPocApplication`.
+
+### `./mvnw clean install` — confirmed BUILD SUCCESS
+```
+[INFO] Running com.wfm.poc.WorkforceAiMvcPocApplicationTests
+...
+[INFO] Found @SpringBootConfiguration com.wfm.poc.WorkforceAiMvcPocApplication for test class com.wfm.poc.WorkforceAiMvcPocApplicationTests
+...
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO]
+[INFO] --- jar:3.5.0:jar (default-jar) @ workforce-ai-mvc-poc ---
+[INFO] Building jar: /Users/yalamanchili/Development/workforce-ai-mvc-poc/target/workforce-ai-mvc-poc-0.0.1-SNAPSHOT.jar
+[INFO]
+[INFO] --- spring-boot:4.1.0:repackage (repackage) @ workforce-ai-mvc-poc ---
+[INFO] Replacing main artifact ... with repackaged archive, adding nested dependencies in BOOT-INF/.
+[INFO]
+[INFO] --- install:3.1.4:install (default-install) @ workforce-ai-mvc-poc ---
+[INFO] Installing .../workforce-ai-mvc-poc-0.0.1-SNAPSHOT.jar to /Users/yalamanchili/.m2/repository/com/wfm/poc/workforce-ai-mvc-poc/0.0.1-SNAPSHOT/workforce-ai-mvc-poc-0.0.1-SNAPSHOT.jar
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  3.806 s
+```
+The context-load test actually connected the full app context to the real running Postgres (HikariCP pool started, PGVectorStore schema check ran against the live `vector_store` table) — this was not a mocked/sliced test, it's a genuine full Spring context boot. `mvn clean install` is now clean end to end.

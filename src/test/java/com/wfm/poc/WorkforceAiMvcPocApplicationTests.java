@@ -1,4 +1,4 @@
-package workforce_ai_mvc_poc;
+package com.wfm.poc;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
