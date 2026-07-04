@@ -1,0 +1,37 @@
+services:
+  postgres-wfm:
+    image: ankane/pgvector:latest
+    container_name: postgres-wfm-poc
+    environment:
+      POSTGRES_DB: wfm_db
+      POSTGRES_USER: wfm_manager
+      POSTGRES_PASSWORD: production_hardened_secret_2026
+    ports:
+      - "54321:5432"
+    volumes:
+      - pgdata_wfm:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wfm_manager -d wfm_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  kafka-wfm:
+    image: apache/kafka:latest
+    container_name: kafka-wfm-poc
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@localhost:9093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka-wfm:9092,EXTERNAL://localhost:9094'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+
+volumes:
+  pgdata_wfm:
