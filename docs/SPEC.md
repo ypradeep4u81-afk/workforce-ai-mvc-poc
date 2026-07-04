@@ -57,6 +57,7 @@ Minimal vertical slice: SSE endpoint (with a required conversationId) → ChatCl
 Outbox poller + dual-event SSE stream: background virtual-thread loop publishing outbox rows to Kafka; wire the controller to emit both chat-progress and structured tool-result SSE events. Validate directly in psql and Kafka console tools.
 Resilience layer: Semaphore-based DB pool protection, Ollama/ChatClient rate limiting, SSE heartbeat broadcaster.
 Agent expansion: Spring AI chat-memory advisors using the already-threaded conversationId, then pgvector-backed RAG.
+---
 *Addendum (post-baseline):*
 ## Security posture (intentional, POC scope)
 - DB credentials, Kafka config, and static API key are placeholder dev 
