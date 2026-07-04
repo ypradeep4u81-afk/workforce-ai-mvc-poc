@@ -205,3 +205,12 @@ Date: 2026-07-04. Cleanup-only session, scoped exactly to the build failure docu
 [INFO] Total time:  3.806 s
 ```
 The context-load test actually connected the full app context to the real running Postgres (HikariCP pool started, PGVectorStore schema check ran against the live `vector_store` table) — this was not a mocked/sliced test, it's a genuine full Spring context boot. `mvn clean install` is now clean end to end.
+
+## Architecture — documented
+Date: 2026-07-04. See [ARCHITECTURE.md](ARCHITECTURE.md) for a sequence diagram
+of the actual request lifecycle and a flowchart of the actual deployment
+topology, both drawn from the real controller/tool/poller/config code (not
+SPEC.md's prose). Notes two implementation gaps found while documenting:
+`WfmSchedulingTools` is a plain `new`'d POJO (not a Spring bean), so its
+`@Transactional` on `assignShift` isn't proxied/enforced; and
+`TransactionalOutboxPoller.processOutboxQueue()` isn't itself `@Transactional`.
