@@ -76,3 +76,94 @@ documented tradeoff.
 ## Git
 - Baseline committed and tagged: `baseline-e2e-working`
 - Repo: https://github.com/ypradeep4u81-afk/workforce-ai-mvc-poc
+
+## Verification — Pre-Session 5
+Date: 2026-07-04. Verification-only session (no code changes made). Ran against the containers already up from the prior manual E2E test (uptime ~2h at start of this session), not a fresh bring-up.
+
+### 1. `mvn clean install` — FAILS (discrepancy vs. STATE.md assumption)
+Command:
+```
+./mvnw clean install
+```
+Result: **BUILD FAILURE**, not clean. Main compile and resource steps succeed (8 source files compile fine), but the test phase fails:
+```
+[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0
+[ERROR] workforce_ai_mvc_poc.WorkforceAiMvcPocApplicationTests » IllegalState
+  Unable to find a @SpringBootConfiguration by searching packages upwards from the test.
+```
+Root cause: [src/test/java/workforce_ai_mvc_poc/WorkforceAiMvcPocApplicationTests.java](../src/test/java/workforce_ai_mvc_poc/WorkforceAiMvcPocApplicationTests.java) is still in the **old underscored package** (`workforce_ai_mvc_poc`), left behind by the "consolidated from an earlier underscored structure" refactor mentioned above. The real `@SpringBootApplication` class now lives at `com.wfm.poc.WorkforceAiMvcPocApplication` ([src/main/java/com/wfm/poc/WorkforceAiMvcPocApplication.java](../src/main/java/com/wfm/poc/WorkforceAiMvcPocApplication.java)), so Spring Boot's upward package search from the test's package never finds it.
+Also found a second orphaned leftover in the same old package: [src/main/java/workforce_ai_mvc_poc/domain/ShiftAssignment.java](../src/main/java/workforce_ai_mvc_poc/domain/ShiftAssignment.java) — an unused duplicate record of `com.wfm.poc.domain.ShiftAssignment`. It compiles (harmless dead code) but confirms the package consolidation was incomplete.
+Per session instructions this was verification-only — **not fixed**, just documented. Needs cleanup before Session 5 work starts.
+
+### 2. Infrastructure reachability — CONFIRMED
+Containers were already running (not started fresh this session):
+```
+docker compose -f compose.yaml ps
+```
+```
+NAME               IMAGE                    STATUS                       PORTS
+kafka-wfm-poc      apache/kafka:latest      Up About an hour             0.0.0.0:9094->9094/tcp
+postgres-wfm-poc   ankane/pgvector:latest   Up About an hour (healthy)   0.0.0.0:54321->5432/tcp
+```
+Port reachability confirmed directly (not inferred from app logs):
+```
+nc -zv localhost 9094   → Connection to localhost port 9094 [tcp/*] succeeded!
+nc -zv localhost 54321  → Connection to localhost port 54321 [tcp/*] succeeded!
+```
+Postgres query reachability (host has no local `psql`; used `docker exec` into the running container instead):
+```
+docker exec postgres-wfm-poc psql -U wfm_manager -d wfm_db -c "SELECT 1 AS reachable;"
+```
+```
+ reachable
+-----------
+         1
+```
+
+### 3. Postgres direct inspection — CONFIRMED, matches STATE.md claim
+```
+docker exec postgres-wfm-poc psql -U wfm_manager -d wfm_db -c "SELECT * FROM shift_assignments WHERE employee_id = 'EMP99';"
+```
+```
+ id | employee_id | shift_date |  role   |         created_at
+----+-------------+------------+---------+----------------------------
+  1 | EMP99       | 2026-07-06 | Cashier | 2026-07-04 10:05:22.810458
+```
+```
+docker exec postgres-wfm-poc psql -U wfm_manager -d wfm_db -c "SELECT * FROM outbox_events;"
+```
+```
+                  id                  |  aggregate_type  | aggregate_id |  event_type   |                                              payload                                              |  status   |         created_at
+--------------------------------------+------------------+--------------+---------------+---------------------------------------------------------------------------------------------------+-----------+----------------------------
+ 537a2c3f-ebbc-46a4-9e3d-7e9a1e31edbf | SHIFT_ASSIGNMENT | EMP99        | SHIFT_CREATED | {"role":"Cashier","conversationId":"conv_2026_07_04_01","employeeId":"EMP99","date":"2026-07-06"} | PROCESSED | 2026-07-04 10:05:22.804751
+```
+Confirmed: row exists with correct `employee_id`/`shift_date`/`role`, and the outbox row status is `PROCESSED` (not just inserted), matching the shift row's `aggregate_id`.
+
+### 4. Kafka direct inspection — CONFIRMED, payload matches DB row exactly
+No local kafka CLI tools on host (`kafka-console-consumer.sh` not found), so ran the consumer inside the broker container instead:
+```
+docker exec kafka-wfm-poc /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+```
+```
+__consumer_offsets
+wfm.audit.shifts
+```
+```
+docker exec kafka-wfm-poc /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic wfm.audit.shifts --from-beginning --property print.key=true --property key.separator=" | " --timeout-ms 8000
+```
+```
+EMP99 | {"role":"Cashier","conversationId":"conv_2026_07_04_01","employeeId":"EMP99","date":"2026-07-06"}
+Processed a total of 1 messages
+```
+Kafka record key (`EMP99`) matches `outbox_events.aggregate_id`; record value is byte-for-byte identical to `outbox_events.payload`. This is a genuine field-by-field comparison, not just "a message exists."
+
+### Summary of discrepancies found vs. STATE.md
+- ❌ **`mvn clean install` is NOT clean** — fails in the test phase due to a leftover test class in the pre-consolidation `workforce_ai_mvc_poc` package that can't locate the `com.wfm.poc` Spring Boot configuration. Main/resources compilation itself is fine.
+- ⚠️ A second leftover file (`src/main/java/workforce_ai_mvc_poc/domain/ShiftAssignment.java`) is unused dead code from the same incomplete package consolidation — compiles but should be removed.
+- ✅ Postgres `shift_assignments` EMP99 row: confirmed, values match.
+- ✅ Postgres `outbox_events` row: confirmed `PROCESSED`, payload matches.
+- ✅ Kafka `wfm.audit.shifts` topic: confirmed message exists, key and payload match the DB row exactly.
+- ℹ️ Infra containers were already running at session start (~1hr uptime) — this session did not perform a fresh `docker compose up`; reachability was still independently re-verified via `nc` and direct queries rather than assumed.
+
+**Action needed before Session 5**: delete/fix the two leftover `workforce_ai_mvc_poc`-package files so `mvn clean install` passes cleanly, per SPEC.md's "run a full mvn clean install and confirm it's clean before calling any milestone done" requirement.
