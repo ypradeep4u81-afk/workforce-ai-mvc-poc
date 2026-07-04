@@ -8,6 +8,7 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
@@ -26,6 +27,7 @@ public class TransactionalOutboxPoller {
     }
 
     @Scheduled(fixedDelay = 500)
+    @Transactional
     public void processOutboxQueue() {
         List<OutboxEvent> pendingEvents = repository.fetchPendingEvents();
         

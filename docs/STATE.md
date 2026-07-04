@@ -288,3 +288,8 @@ grep -rn "new [A-Z][A-Za-z]*(" src/main/java --include="*.java"
 - `ObjectMapper` (×1) — Jackson utility class, no AOP-relevant annotations, correctly stateless and instance-per-use here.
 
 **Conclusion**: the two bugs fixed earlier in this session were the only instances of this bug class in the codebase. No further proxy-bypass issues found; nothing else required fixing.
+
+## Architecture diagrams — re-confirmed current
+Date: 2026-07-04. Documentation-only session (no code changes). Re-read the controller, tool component, repository, outbox poller, `application.properties`, and `compose.yaml` directly against the diagrams in [ARCHITECTURE.md](ARCHITECTURE.md) rather than assuming the prior version was still accurate.
+
+Updated ARCHITECTURE.md to: (1) show `WfmSchedulingTools` as a constructor-injected `@Service` bean invoked through a real AOP proxy, and `TransactionalOutboxPoller.processOutboxQueue()` as `@Transactional`, matching the fixes above; (2) replace the old "accuracy findings" callouts (which described the two bugs as current issues) with a short "found and fixed" note pointing back here; (3) add an explicit callout — and an `alt` branch in the sequence diagram — for the still-open gap identified during the failure-case test: `assignShift`'s catch block swallows exceptions instead of rethrowing, so the AOP proxy still commits partial writes on an internal failure. The AOP-proxy audit above found no additional instances of the original bug class, so no further diagram changes were needed beyond these two documented issues.

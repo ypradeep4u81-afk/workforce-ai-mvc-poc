@@ -1,9 +1,9 @@
 # Architecture — as implemented
 
 This document reflects the code actually present in this repo as of 2026-07-04
-(post-cleanup, `mvn clean install` green — see [STATE.md](STATE.md)). It is not
-a description of SPEC.md's aspirational design; every element below was
-confirmed by reading
+(post transactional-proxy fix, `mvn clean install` green — see
+[STATE.md](STATE.md)). It is not a description of SPEC.md's aspirational
+design; every element below was confirmed by reading
 [WfmSchedulingController.java](../src/main/java/com/wfm/poc/controller/WfmSchedulingController.java),
 [WfmSchedulingTools.java](../src/main/java/com/wfm/poc/tool/WfmSchedulingTools.java),
 [WfmRepository.java](../src/main/java/com/wfm/poc/repository/WfmRepository.java),
@@ -11,17 +11,36 @@ confirmed by reading
 [application.properties](../src/main/resources/application.properties), and
 [compose.yaml](../compose.yaml).
 
-Two implementation details worth flagging up front because they affect how to
-read the diagrams below:
-- `WfmSchedulingTools` is constructed with plain `new WfmSchedulingTools(repository)`
-  in the controller constructor ([WfmSchedulingController.java:30](../src/main/java/com/wfm/poc/controller/WfmSchedulingController.java#L30)),
-  not injected as a Spring bean. Its `@Transactional` annotation on `assignShift`
-  is therefore not backed by a Spring AOP proxy — the two inserts in
-  `saveShiftAndOutbox` run as two independent auto-committed statements, not a
-  single atomic transaction.
-- `TransactionalOutboxPoller.processOutboxQueue()` is not itself `@Transactional`;
-  its `SELECT ... FOR UPDATE SKIP LOCKED` executes and releases its row lock
-  within that single auto-committed statement.
+## Proxy-bypass bugs — found and fixed
+
+A prior version of this document flagged two bugs where the transactional
+boundary wasn't real:
+- `WfmSchedulingTools` was constructed with plain `new`, bypassing the Spring
+  AOP proxy that `@Transactional` depends on.
+- `TransactionalOutboxPoller.processOutboxQueue()` had no `@Transactional` at
+  all, so its row lock didn't span the full poll cycle.
+
+Both are fixed in the current code: `WfmSchedulingTools` is now `@Service`
+and constructor-injected into the controller as a real Spring bean, and
+`processOutboxQueue()` now carries `@Transactional`. A follow-up audit
+confirmed no other manual-instantiation-bypasses-proxy instances exist in
+the codebase. See STATE.md's "Transactional bug fix" and "AOP proxy audit"
+sections for the full detail, including the grep methodology used to rule
+out further instances.
+
+## Known open gap — not yet fixed
+
+The proxy now exists, but `assignShift`'s `try { ... } catch (Exception e) {
+...; return errorJson; }` still swallows exceptions instead of rethrowing
+them. Spring's `@Transactional` proxy only rolls back on an exception that
+propagates *out of* the method; because `assignShift` always returns
+normally (even on failure), the proxy sees a "successful" invocation and
+commits — including any partial write made before the failure. A live
+failure-injection test (documented in STATE.md) confirmed this: a thrown
+exception between the two inserts left a committed `shift_assignments` row
+with no matching `outbox_events` row. This is called out explicitly in the
+diagrams below (the `alt` branch in Diagram 1) rather than treated as fully
+solved.
 
 ## 1. Functional flow (request lifecycle)
 
@@ -30,17 +49,20 @@ A manager opens the SSE endpoint with a static API-key header, a caller-supplied
 tokens as they arrive, then — once the model's tool call has actually returned —
 streams the tool's authoritative JSON as a second, distinct event type, per
 `WfmSchedulingController.streamScheduling` and `WfmSchedulingTools.assignShift`.
-Outbox publication to Kafka happens on a separate 500ms poll loop, fully
-decoupled from the request/response cycle.
+`WfmSchedulingTools` is a constructor-injected `@Service` bean, so
+`@Transactional` on `assignShift` runs through a real AOP proxy. Outbox
+publication to Kafka happens on a separate 500ms poll loop
+(`TransactionalOutboxPoller.processOutboxQueue`, itself now `@Transactional`),
+fully decoupled from the request/response cycle.
 
 ```mermaid
 sequenceDiagram
     actor Manager
     participant Controller as WfmSchedulingController
     participant Ollama as ChatClient / Ollama (llama3.1)
-    participant Tools as WfmSchedulingTools
+    participant Tools as WfmSchedulingTools (@Service, proxied)
     participant DB as Postgres (shift_assignments + outbox_events)
-    participant Poller as TransactionalOutboxPoller
+    participant Poller as TransactionalOutboxPoller (@Transactional)
     participant Kafka as Kafka (wfm.audit.shifts)
 
     Manager->>Controller: GET /api/wfm/schedule-stream?conversationId&prompt (X-API-Key header)
@@ -55,13 +77,20 @@ sequenceDiagram
             Ollama-->>Controller: next token
             Controller-->>Manager: SSE event "chat-progress" (raw token)
         end
-        Ollama->>Tools: invoke assignShift(employeeId, shiftDate, role, conversationId)
+        Ollama->>Tools: invoke assignShift(employeeId, shiftDate, role, conversationId) [via AOP proxy, @Transactional starts]
         Tools->>Tools: acquire dbThrottler permit (1 of 25)
         Tools->>DB: INSERT INTO shift_assignments
-        Tools->>DB: INSERT INTO outbox_events (status=PENDING)
-        DB-->>Tools: rows written
-        Tools->>Tools: sessionExecutionResults.put(conversationId, successJson)
-        Tools-->>Ollama: return successJson (ground truth, logged server-side unconditionally)
+        alt saveShiftAndOutbox succeeds
+            Tools->>DB: INSERT INTO outbox_events (status=PENDING)
+            DB-->>Tools: rows written
+            Tools->>Tools: sessionExecutionResults.put(conversationId, successJson)
+            Tools-->>Ollama: return successJson (ground truth, logged server-side unconditionally)
+            Note over Tools,DB: proxy sees normal return -> COMMIT (both inserts)
+        else saveShiftAndOutbox throws (e.g. constraint violation)
+            Tools->>Tools: catch(Exception) builds errorJson, does NOT rethrow
+            Tools-->>Ollama: return errorJson
+            Note over Tools,DB: KNOWN GAP: proxy still sees a normal return -> COMMIT<br/>partial write (shift row with no outbox row) is NOT rolled back
+        end
         Ollama-->>Controller: stream onComplete
         Controller->>Tools: getExecutionResult(conversationId)
         Controller-->>Manager: SSE event "tool-result" (authoritative JSON)
@@ -69,9 +98,9 @@ sequenceDiagram
     end
 
     par background loop, decoupled from the request above
-        loop every 500ms
+        loop every 500ms, single @Transactional method
             Poller->>DB: SELECT * FROM outbox_events WHERE status='PENDING' FOR UPDATE SKIP LOCKED
-            DB-->>Poller: pending rows
+            DB-->>Poller: pending rows (locks held for full cycle)
             Poller->>Kafka: send(wfm.audit.shifts, aggregateId, payload) [acks=all]
             Kafka-->>Poller: broker ack
             Poller->>DB: UPDATE outbox_events SET status='PROCESSED'
@@ -96,11 +125,11 @@ flowchart LR
         Manager["Manager<br/>(HTTP/SSE client)"]
 
         subgraph App["Spring Boot app — :8081 (./mvnw, virtual threads on)"]
-            Controller["WfmSchedulingController<br/>SSE endpoint + static X-API-Key check"]
+            Controller["WfmSchedulingController<br/>SSE endpoint + static X-API-Key check<br/>constructor-injects WfmSchedulingTools bean"]
             ChatClientNode["ChatClient (Spring AI 2.0.0)"]
-            ToolsNode["WfmSchedulingTools<br/>(plain POJO, new'd by controller)"]
+            ToolsNode["WfmSchedulingTools<br/>@Service bean, AOP-proxied @Transactional<br/>(constructor-injected, not new'd)"]
             Repo["WfmRepository<br/>(JdbcTemplate)"]
-            Poller["TransactionalOutboxPoller<br/>@Scheduled fixedDelay=500ms"]
+            Poller["TransactionalOutboxPoller<br/>@Component, @Scheduled fixedDelay=500ms<br/>processOutboxQueue() is @Transactional"]
         end
 
         Ollama["Ollama — :11434<br/>model: llama3.1 (local process, not in compose)"]
@@ -115,10 +144,10 @@ flowchart LR
     Controller -->|SSE: chat-progress, tool-result| Manager
     Controller --> ChatClientNode
     ChatClientNode <-->|"HTTP :11434"| Ollama
-    ChatClientNode -->|tool call| ToolsNode
+    ChatClientNode -->|"tool call (via Spring AOP proxy)"| ToolsNode
     ToolsNode --> Repo
-    Repo -->|"jdbc:postgresql://localhost:54321/wfm_db<br/>INSERT shift_assignments + outbox_events"| Postgres
-    Poller -->|"SELECT ... FOR UPDATE SKIP LOCKED"| Postgres
+    Repo -->|"jdbc:postgresql://localhost:54321/wfm_db<br/>INSERT shift_assignments + outbox_events<br/>(atomic on success; NOT atomic on internal-catch failure, see Known Open Gap)"| Postgres
+    Poller -->|"SELECT ... FOR UPDATE SKIP LOCKED<br/>(within @Transactional method)"| Postgres
     Poller -->|"UPDATE status=PROCESSED"| Postgres
     Poller -->|"produce acks=all<br/>bootstrap-servers=localhost:9094<br/>topic wfm.audit.shifts"| Kafka
 ```

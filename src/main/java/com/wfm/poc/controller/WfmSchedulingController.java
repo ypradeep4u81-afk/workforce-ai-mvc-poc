@@ -25,9 +25,9 @@ public class WfmSchedulingController {
     private final Semaphore ollamaLimiter = new Semaphore(4); 
     private final ExecutorService heartbeatScheduler = Executors.newVirtualThreadPerTaskExecutor();
 
-    public WfmSchedulingController(ChatModel chatModel, WfmRepository repository) {
+    public WfmSchedulingController(ChatModel chatModel, WfmRepository repository, WfmSchedulingTools schedulingTools) {
         this.chatModel = chatModel;
-        this.schedulingTools = new WfmSchedulingTools(repository);
+        this.schedulingTools = schedulingTools;
         repository.initTables();
     }
 
