@@ -61,17 +61,22 @@ public class WfmSchedulingTools {
             event.setCreatedAt(LocalDateTime.now());
 
             repository.saveShiftAndOutbox(employeeId, parsedDate, role, event);
-            
+
             String successJson = String.format("{\"status\":\"SUCCESS\",\"employeeId\":\"%s\",\"date\":\"%s\",\"role\":\"%s\"}", employeeId, shiftDate, role);
             log.info("[GROUND_TRUTH_TOOL_SUCCESS] Session: {} -> {}", conversationId, successJson);
             sessionExecutionResults.put(conversationId, successJson);
             return successJson;
-            
+
         } catch (Exception e) {
-            String errorJson = String.format("{\"status\":\"FAILED\",\"error\":\"%s\"}", e.getMessage());
             log.error("[GROUND_TRUTH_TOOL_CRITICAL_FAILURE] Session: {}", conversationId, e);
-            sessionExecutionResults.put(conversationId, errorJson);
-            return errorJson;
+            // Rethrow (don't swallow) so the exception propagates out of this proxied method -
+            // that's the only way the @Transactional AOP proxy sees a failure and rolls back.
+            // Error-to-JSON conversion now happens at the tool-calling call site (controller),
+            // after the transaction has already rolled back.
+            if (e instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new IllegalStateException("assignShift failed for conversation " + conversationId, e);
         } finally {
             dbThrottler.release();
         }

@@ -293,3 +293,53 @@ grep -rn "new [A-Z][A-Za-z]*(" src/main/java --include="*.java"
 Date: 2026-07-04. Documentation-only session (no code changes). Re-read the controller, tool component, repository, outbox poller, `application.properties`, and `compose.yaml` directly against the diagrams in [ARCHITECTURE.md](ARCHITECTURE.md) rather than assuming the prior version was still accurate.
 
 Updated ARCHITECTURE.md to: (1) show `WfmSchedulingTools` as a constructor-injected `@Service` bean invoked through a real AOP proxy, and `TransactionalOutboxPoller.processOutboxQueue()` as `@Transactional`, matching the fixes above; (2) replace the old "accuracy findings" callouts (which described the two bugs as current issues) with a short "found and fixed" note pointing back here; (3) add an explicit callout — and an `alt` branch in the sequence diagram — for the still-open gap identified during the failure-case test: `assignShift`'s catch block swallows exceptions instead of rethrowing, so the AOP proxy still commits partial writes on an internal failure. The AOP-proxy audit above found no additional instances of the original bug class, so no further diagram changes were needed beyond these two documented issues.
+
+## Exception propagation fix
+Date: 2026-07-04. Scoped exactly to closing the open gap documented above: `assignShift`'s catch block swallowed exceptions instead of rethrowing, defeating `@Transactional` rollback. No other files touched (a temporary failure-injection hook was added to and fully reverted from `WfmRepository.java` for testing only — confirmed via `git diff` showing a clean no-op).
+
+### What changed
+1. **[WfmSchedulingTools.java](../src/main/java/com/wfm/poc/tool/WfmSchedulingTools.java)** — `assignShift`'s catch block no longer builds an `errorJson` string and returns it. It now logs the failure (unchanged, still unconditional per SPEC.md's ground-truth-logging requirement) and rethrows: the original exception directly if it's already a `RuntimeException`, otherwise wrapped in an `IllegalStateException`. This lets the exception propagate out of the proxied method, which is the only way the `@Transactional` AOP proxy observes a failure and rolls back.
+2. **[WfmSchedulingController.java](../src/main/java/com/wfm/poc/controller/WfmSchedulingController.java)** — this is the actual "call site": moved error-to-JSON conversion into the reactive stream's `error ->` callback in `chatClient.prompt().stream().content().subscribe(...)`. It walks the exception's cause chain for a `ToolExecutionException` (Spring AI's wrapper around a thrown tool exception); if found, it builds the same `{"status":"FAILED","error":...}` contract the old code used (now via `ObjectMapper` instead of unescaped `String.format`, closing a minor JSON-injection risk in the same touched line) and emits it as a `tool-result` SSE event — so any consumer parsing for ground truth sees the same event type/shape on both success and failure. Genuine non-tool stream errors (e.g. Ollama connectivity failures) are left on the pre-existing generic `error` SSE event, unchanged. Also added a one-line cleanup (`schedulingTools.getExecutionResult(conversationId)`, discarding the return value) in the error branch to remove the stale `NO_CALL` placeholder `registerSession` left in `sessionExecutionResults` — without this, that entry would never be removed on the failure path (the success path's `onComplete()` callback, which normally does the removal, never fires once the stream errors instead of completing), leaking one map entry per failed conversation.
+
+### API gotcha found and worked around (verify-live, not from training data)
+Setting `spring.ai.tools.throw-exception-on-error=true` in `application.properties` alone **does nothing** here. Spring AI 2.0.0's `ToolCallingAutoConfiguration` binds that property to a `ToolExecutionExceptionProcessor`/`ToolCallingManager` bean pair, but this controller builds its `ChatClient` directly via the static single-arg factory `ChatClient.builder(chatModel)` (not by injecting an autoconfigured `ChatClient.Builder`/`ToolCallingManager` bean). Reading `DefaultChatClientBuilder`'s bytecode confirmed the single-arg path passes a `null` `ToolCallingAdvisor.Builder`, which falls back to `ToolCallingManager.builder().build()` — a fresh instance with the library default `alwaysThrow=false`, completely bypassing the Spring-bound property/bean. With that default, `DefaultToolCallingManager` catches a tool's thrown exception, converts it via `DefaultToolExecutionExceptionProcessor.process(...)` into a plain string, and returns that string to the LLM as a normal tool response — the reactive stream never errors, `.subscribe()`'s `error` callback never fires, and the `@Transactional` proxy's already-correct rollback would have been for nothing as far as the caller could tell (first live test run below reproduced exactly this: tool invocation confirmed via server log, but the SSE stream completed normally with a hallucinated LLM narration and a stale `NO_CALL` tool-result).
+Fix: build a `ToolCallingManager` explicitly with `DefaultToolExecutionExceptionProcessor.builder().alwaysThrow(true).build()`, and pass it into the 5-arg `ChatClient.builder(chatModel, ObservationRegistry.NOOP, null, null, ToolCallingAdvisor.builder().toolCallingManager(...))` overload. The `spring.ai.tools.throw-exception-on-error` property was added to `application.properties` then removed again once this was confirmed dead for this codebase's usage pattern (no autoconfigured `ChatClient.Builder` is ever used) — `git diff` on that file is a clean no-op.
+
+### Failure-case re-test — confirmed full rollback, no partial write
+Rebuilt with the same temporary failure-injection hook as the original bug report (`if (true) { throw new RuntimeException("TEMPORARY_FAILURE_INJECTION_TEST"); }` in `WfmRepository.saveShiftAndOutbox`, between the two inserts), restarted the app, called the endpoint with a fresh employee (`EMP_ROLLBACK_TEST3`, conversationId `conv_rollback_test_3`):
+```
+event:tool-result
+data:{"status":"FAILED","error":"TEMPORARY_FAILURE_INJECTION_TEST"}
+```
+Server log confirms the AOP proxy actually intercepted the call and the exception genuinely propagated through the full tool-calling stack (`WfmSchedulingTools$$SpringCGLIB$$0.assignShift` → `MethodToolCallback.call` → `DefaultToolCallingManager.executeToolCall` → `ToolCallingAdvisor.handleToolCallRecursion`) up to the controller's `error` callback, which logged and converted it.
+Direct psql verification (not inferred from the response):
+```
+docker exec postgres-wfm-poc psql -U wfm_manager -d wfm_db -c "SELECT * FROM shift_assignments WHERE employee_id = 'EMP_ROLLBACK_TEST3';"
+ (0 rows)
+docker exec postgres-wfm-poc psql -U wfm_manager -d wfm_db -c "SELECT * FROM outbox_events WHERE aggregate_id = 'EMP_ROLLBACK_TEST3';"
+ (0 rows)
+```
+**Zero rows in both tables** — unlike the original bug report (which left a committed `shift_assignments` row with no matching `outbox_events` row), this time the `shift_assignments` insert made before the injected throw was rolled back along with everything else. Full atomicity confirmed, not partial.
+The test hook was then fully reverted (`git diff` on `WfmRepository.java` confirmed clean no-op) and the app rebuilt before the happy-path re-test below.
+
+### Happy-path re-test — still works
+Ran the endpoint against a fresh employee (`EMP_HAPPY_TEST1`, conversationId `conv_happy_test_1`):
+```
+event:tool-result
+data:{"status":"SUCCESS","employeeId":"EMP_HAPPY_TEST1","date":"2026-07-11","role":"Cashier"}
+```
+Independently verified via psql and Kafka (not the LLM's narration or the SSE response):
+- **psql**: `shift_assignments` row present (`EMP_HAPPY_TEST1`, `2026-07-11`, `Cashier`).
+- **psql**: `outbox_events` row present, `status = PROCESSED`, `aggregate_id` matches.
+- **kafka-console-consumer**: message present on `wfm.audit.shifts`, key/payload byte-for-byte match the DB row's `employeeId`/`conversationId`/`role`/`date`.
+Both test employees' rows (`EMP_HAPPY_TEST1` — the rollback test employee left zero rows by design) were deleted from `shift_assignments`/`outbox_events` afterward to leave the DB in the state it was in before this session.
+
+### `mvn clean install` — confirmed BUILD SUCCESS, clean
+```
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+...
+[INFO] BUILD SUCCESS
+```
+
+### Conclusion
+The known open gap flagged in ARCHITECTURE.md ("Known open gap — not yet fixed") is now closed: `assignShift` rethrows instead of swallowing, and the `ChatClient`'s tool-calling manager is explicitly configured to propagate that exception instead of absorbing it into a string tool-response — both halves were necessary, since fixing only the first (as originally scoped) would have had no observable effect with this controller's manual `ChatClient` construction pattern. The transactional outbox pattern's atomicity guarantee is now real on both the success and failure paths, confirmed by live failure-injection and psql/Kafka ground-truth checks rather than assumed from the code.
