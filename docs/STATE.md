@@ -214,3 +214,77 @@ SPEC.md's prose). Notes two implementation gaps found while documenting:
 `WfmSchedulingTools` is a plain `new`'d POJO (not a Spring bean), so its
 `@Transactional` on `assignShift` isn't proxied/enforced; and
 `TransactionalOutboxPoller.processOutboxQueue()` isn't itself `@Transactional`.
+
+## Transactional bug fix
+Date: 2026-07-04. Scoped exactly to the two bugs documented in ARCHITECTURE.md. No other files touched.
+
+### What changed
+1. **[WfmSchedulingTools.java](../src/main/java/com/wfm/poc/tool/WfmSchedulingTools.java)** — added `@Service`. It's now a Spring-managed bean, so `@Transactional` on `assignShift` is backed by a real AOP proxy.
+2. **[WfmSchedulingController.java](../src/main/java/com/wfm/poc/controller/WfmSchedulingController.java)** — constructor now takes `WfmSchedulingTools` as an injected parameter instead of calling `new WfmSchedulingTools(repository)`. This was the actual proxy-bypass: even with step 1's annotation, constructing the object manually inside the controller would still skip the container/proxy entirely.
+3. **[TransactionalOutboxPoller.java](../src/main/java/com/wfm/poc/outbox/TransactionalOutboxPoller.java)** — added `@Transactional` to `processOutboxQueue()`, so the `FOR UPDATE SKIP LOCKED` row locks are held for the full poll cycle (fetch → Kafka publish → status update) instead of being released the instant the initial `SELECT` statement auto-committed.
+
+### Confirmed: no other manual-instantiation-bypasses-proxy issues
+`grep -rn "@Transactional"` across `src/main/java` found exactly one annotated method both before and after this fix (`WfmSchedulingTools.assignShift`) — `TransactionalOutboxPoller` had no prior `@Transactional` to bypass, it simply lacked the annotation. A second grep for `new [A-Z]` across `src/main/java` turned up only plain data/utility objects (`OutboxEvent`, `Semaphore`, `SseEmitter`, `ObjectMapper`) — none of these are Spring-managed components with their own annotations to bypass. No other instances of this bug class exist in the codebase.
+
+### `mvn clean install` — BUILD SUCCESS, confirmed clean (re-run after revert of the temporary test hook below).
+
+### E2E re-verification (happy path)
+Restarted the running app (an older instance from before this fix was still bound to :8081 and had to be killed first — otherwise the fix wouldn't have been exercised). Ran the cURL test against a fresh employee/conversation pair (`EMP77`, then `EMP88` after the rollback test), then independently checked ground truth:
+- **psql**: `shift_assignments` row present, correct values.
+- **psql**: `outbox_events` row present, `status = PROCESSED`, `aggregate_id` matches.
+- **kafka-console-consumer**: message present on `wfm.audit.shifts`, key/payload byte-for-byte match the DB row.
+
+This confirms presence of correct data post-fix, consistent with the Pre-Session 5 verification. It does **not** by itself prove atomicity — that required the failure-case test below.
+
+### Failure-case test — atomicity is only partially real; a second bug was found
+Per session instructions, temporarily added `if (true) { throw new RuntimeException(...); }` in [WfmRepository.saveShiftAndOutbox](../src/main/java/com/wfm/poc/repository/WfmRepository.java) between the `shift_assignments` insert and the `outbox_events` insert, rebuilt, restarted the app, and called the endpoint with a new employee (`EMP_ROLLBACK_TEST`).
+
+**Expected** (if the transaction boundary from this session's fix were fully real): the `shift_assignments` insert rolls back along with the missing `outbox_events` insert — zero rows in either table for `EMP_ROLLBACK_TEST`.
+
+**Actual result**:
+```
+docker exec postgres-wfm-poc psql -U wfm_manager -d wfm_db -c "SELECT * FROM shift_assignments WHERE employee_id = 'EMP_ROLLBACK_TEST';"
+ id |    employee_id    | shift_date |  role   |         created_at
+----+-------------------+------------+---------+----------------------------
+  4 | EMP_ROLLBACK_TEST | 2026-07-11 | Cashier | 2026-07-04 12:02:25.982871
+(1 row)
+
+docker exec postgres-wfm-poc psql -U wfm_manager -d wfm_db -c "SELECT * FROM outbox_events WHERE aggregate_id = 'EMP_ROLLBACK_TEST';"
+(0 rows)
+```
+The `shift_assignments` row **committed anyway**, with no matching outbox row — exactly the split-brain state the Transactional Outbox pattern exists to prevent.
+
+**Root cause**: `WfmSchedulingTools.assignShift` wraps its body in `try { ... } catch (Exception e) { ...; return errorJson; }`. Spring's `@Transactional` proxy only triggers a rollback when an (unchecked) exception propagates *out of* the proxied method. Because `assignShift` catches the exception internally and returns a normal `errorJson` string instead of rethrowing, the proxy sees what looks like a successful, exception-free invocation and commits the transaction — including the partial write made before the throw. This is a **separate, pre-existing bug** from the two this session was scoped to fix: it exists independently of whether `WfmSchedulingTools` is a Spring bean, and would reproduce with any DB exception thrown inside `saveShiftAndOutbox` (not just this synthetic test hook) — e.g. a constraint violation on the second insert would currently leave the first insert committed.
+
+The test hook was fully reverted immediately after this observation (`git diff` on `WfmRepository.java` confirmed a clean no-op diff post-revert), the app was rebuilt and re-verified clean (`mvn clean install` + a second happy-path E2E run for `EMP88`, matched in psql/Kafka), and the `EMP_ROLLBACK_TEST` row was deleted from `shift_assignments` to leave the DB in the state it was in before this test.
+
+**Not fixed in this session** (out of scope per session instructions to touch only the two documented bugs) — flagging for a follow-up: `assignShift`'s catch block should rethrow (or the method should not catch broadly at all) so the `@Transactional` proxy actually sees the failure and rolls back. As it stands today, the fixes in this session make the proxy *exist*, but the try/catch means the failure path still isn't atomic.
+
+## AOP proxy audit
+Date: 2026-07-04. Verification-only pass, no code changes (the one prior instance of this bug pattern was already fixed above).
+
+Ran the requested search plus two broader ones to be thorough:
+```
+grep -rn "new.*Tools\|new.*Service\|new.*Repository\|new.*Poller" src/main/java --include="*.java"
+```
+→ **zero matches.** The only historical hit for this pattern was `new WfmSchedulingTools(repository)` in `WfmSchedulingController`, already fixed earlier in this session (injected as a bean instead).
+
+Broader sweep, to catch cases the naming-convention grep above would miss (a manually-`new`'d class doesn't have to have "Tools/Service/Repository/Poller" in its name):
+```
+grep -rln "@Transactional\|@Async\|@Cacheable\|@CacheEvict\|@CachePut\|@Retryable\|@PreAuthorize\|@PostAuthorize\|@Secured" src/main/java --include="*.java"
+```
+→ Exactly two classes carry any AOP-relevant annotation in the entire codebase: `WfmSchedulingTools` (`@Transactional`) and `TransactionalOutboxPoller` (`@Transactional`). Both are now `@Service`/`@Component` beans obtained via constructor injection — confirmed no other file constructs either with `new`.
+```
+grep -rn "@Autowired" src/main/java --include="*.java"
+```
+→ Zero matches. All dependency injection in the codebase is constructor-based; there are no `@Autowired` fields/setters that could be silently null if a class were manually instantiated instead of container-managed.
+```
+grep -rn "new [A-Z][A-Za-z]*(" src/main/java --include="*.java"
+```
+→ Six remaining manual-`new` call sites, all of them out of scope for AOP proxying:
+- `OutboxEvent` (×2, in `WfmRepository` and `WfmSchedulingTools`) — confirmed via direct read of [OutboxEvent.java](../src/main/java/com/wfm/poc/domain/OutboxEvent.java): a plain POJO/data-holder, no annotations, no Spring stereotype, not a bean anywhere in the app. Manual `new` is correct here — it's a DTO, not a service.
+- `Semaphore` (×2) — JDK `java.util.concurrent` class, not Spring-managed, no annotations possible.
+- `SseEmitter` (×1) — Spring MVC framework class deliberately created per-HTTP-request (`SseEmitter(300_000L)`); it isn't meant to be a singleton bean by design, this is the framework's intended usage pattern.
+- `ObjectMapper` (×1) — Jackson utility class, no AOP-relevant annotations, correctly stateless and instance-per-use here.
+
+**Conclusion**: the two bugs fixed earlier in this session were the only instances of this bug class in the codebase. No further proxy-bypass issues found; nothing else required fixing.
