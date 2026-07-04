@@ -54,22 +54,27 @@ etc.) via `@ConditionalOnMissingBean` autoconfiguration. If your code builds a
 `ChatClient` through a static factory method instead of injecting the
 autoconfigured `ChatClient.Builder`, you can silently skip that
 autoconfiguration entirely — the factory falls back to library defaults, and
-a property that looks like it should control behavior does nothing. The
-general lesson: when a Spring Boot property "isn't working," check whether the
-object it's supposed to configure is actually the container-managed instance,
-or one your own code assembled by hand.
+even setting the property that looks like it should control this behavior
+would do nothing. The general lesson: when a Spring Boot property "isn't
+working" (or you're about to reach for one), check whether the object it's
+supposed to configure is actually the container-managed instance, or one your
+own code assembled by hand — the property may be a dead end before you even
+set it.
 
 **What happened here:** the controller built its `ChatClient` via the static
 `ChatClient.builder(chatModel)` factory. That path passes a `null`
 `ToolCallingAdvisor.Builder`, which falls back to
 `ToolCallingManager.builder().build()` — a fresh instance with the library
-default `alwaysThrow=false` — completely bypassing the
-`spring.ai.tools.throw-exception-on-error` property. Even after fixing #2
-above (rethrowing in `assignShift`), the tool-calling manager caught that
-rethrown exception and converted it back into a plain string tool response,
-silently undoing the fix. The real fix was constructing the
-`ToolCallingManager` explicitly with `alwaysThrow(true)` and wiring it into
-the `ChatClient` via the multi-arg builder overload.
+default `alwaysThrow=false`. `spring.ai.tools.throw-exception-on-error` was
+never actually set in `application.properties` (confirmed absent from the
+current file and from git history) — it was floated during investigation,
+found to be a dead end for this construction path, and never committed. Even
+after fixing #2 above (rethrowing in `assignShift`), the tool-calling manager
+would have caught that rethrown exception and converted it back into a plain
+string tool response regardless of that property's value, because this
+`ChatClient` construction path never consults it. The real fix was
+constructing the `ToolCallingManager` explicitly with `alwaysThrow(true)` and
+wiring it into the `ChatClient` via the multi-arg builder overload.
 
 **Detail:** see STATE.md → "Exception propagation fix" ("API gotcha found and
 worked around").
