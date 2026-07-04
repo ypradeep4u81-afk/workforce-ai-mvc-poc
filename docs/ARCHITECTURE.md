@@ -1,8 +1,8 @@
 # Architecture — as implemented
 
 This document reflects the code actually present in this repo as of 2026-07-04
-(post transactional-proxy fix, `mvn clean install` green — see
-[STATE.md](STATE.md)). It is not a description of SPEC.md's aspirational
+(post transactional-proxy fix and exception-propagation fix, `mvn clean
+install` green — see [STATE.md](STATE.md)). It is not a description of SPEC.md's aspirational
 design; every element below was confirmed by reading
 [WfmSchedulingController.java](../src/main/java/com/wfm/poc/controller/WfmSchedulingController.java),
 [WfmSchedulingTools.java](../src/main/java/com/wfm/poc/tool/WfmSchedulingTools.java),
@@ -28,19 +28,40 @@ the codebase. See STATE.md's "Transactional bug fix" and "AOP proxy audit"
 sections for the full detail, including the grep methodology used to rule
 out further instances.
 
-## Known open gap — not yet fixed
+## Exception propagation gap — found and fixed
 
-The proxy now exists, but `assignShift`'s `try { ... } catch (Exception e) {
-...; return errorJson; }` still swallows exceptions instead of rethrowing
-them. Spring's `@Transactional` proxy only rolls back on an exception that
-propagates *out of* the method; because `assignShift` always returns
-normally (even on failure), the proxy sees a "successful" invocation and
-commits — including any partial write made before the failure. A live
-failure-injection test (documented in STATE.md) confirmed this: a thrown
-exception between the two inserts left a committed `shift_assignments` row
-with no matching `outbox_events` row. This is called out explicitly in the
-diagrams below (the `alt` branch in Diagram 1) rather than treated as fully
-solved.
+A prior version of this document flagged an open gap: `assignShift`'s
+`try { ... } catch (Exception e) { ...; return errorJson; }` swallowed
+exceptions instead of rethrowing them, so Spring's `@Transactional` proxy
+always saw a "successful" invocation and committed — including any partial
+write made before the failure. A live failure-injection test at the time
+confirmed this: a thrown exception between the two inserts left a committed
+`shift_assignments` row with no matching `outbox_events` row.
+
+This is now fixed, via two changes that were both necessary:
+- `WfmSchedulingTools.assignShift`'s catch block no longer builds an
+  `errorJson` string and returns it. It logs the failure (unconditionally,
+  per SPEC.md's ground-truth-logging requirement) and rethrows — the
+  original exception if it's already a `RuntimeException`, otherwise
+  wrapped in an `IllegalStateException` — so the exception propagates out
+  of the proxied method and the `@Transactional` proxy actually observes
+  the failure and rolls back.
+- `WfmSchedulingController` explicitly builds a `ToolCallingManager` with
+  `DefaultToolExecutionExceptionProcessor.builder().alwaysThrow(true).build()`
+  and wires it into `ChatClient.builder(...)` via a `ToolCallingAdvisor`.
+  This was required because the controller's `ChatClient` isn't built from
+  an autoconfigured `ChatClient.Builder` bean — the 5-arg static factory it
+  uses falls back to a fresh `ToolCallingManager` with the library default
+  `alwaysThrow=false`, which would otherwise catch the rethrown exception
+  and convert it back into a plain string tool-response, silently
+  defeating the rethrow fix above.
+
+A failure-injection re-test (documented in STATE.md's "Exception
+propagation fix" section) confirmed **zero rows** in both
+`shift_assignments` and `outbox_events` after an injected failure — full
+atomicity, not partial. See STATE.md for the full detail, including the
+`ToolExecutionException`/`ChatClient` API investigation behind the second
+change.
 
 ## 1. Functional flow (request lifecycle)
 
@@ -86,15 +107,20 @@ sequenceDiagram
             Tools->>Tools: sessionExecutionResults.put(conversationId, successJson)
             Tools-->>Ollama: return successJson (ground truth, logged server-side unconditionally)
             Note over Tools,DB: proxy sees normal return -> COMMIT (both inserts)
+            Ollama-->>Controller: stream onComplete
+            Controller->>Tools: getExecutionResult(conversationId)
+            Controller-->>Manager: SSE event "tool-result" (successJson)
+            Controller->>Manager: emitter.complete()
         else saveShiftAndOutbox throws (e.g. constraint violation)
-            Tools->>Tools: catch(Exception) builds errorJson, does NOT rethrow
-            Tools-->>Ollama: return errorJson
-            Note over Tools,DB: KNOWN GAP: proxy still sees a normal return -> COMMIT<br/>partial write (shift row with no outbox row) is NOT rolled back
+            Tools->>Tools: catch(Exception) logs failure, RETHROWS (does not return normally)
+            Note over Tools,DB: exception propagates out of proxied method -> ROLLBACK<br/>(both inserts undone, no partial write)
+            Tools--xOllama: exception propagates via MethodToolCallback / DefaultToolCallingManager<br/>(alwaysThrow(true) processor - no swallow-to-string fallback)
+            Ollama--xController: stream error callback fires (not onComplete)
+            Controller->>Controller: findToolExecutionException(error) -> build {"status":"FAILED","error":...}
+            Controller->>Tools: getExecutionResult(conversationId) [discard stale NO_CALL placeholder]
+            Controller-->>Manager: SSE event "tool-result" (FAILED json)
+            Controller->>Manager: emitter.complete()
         end
-        Ollama-->>Controller: stream onComplete
-        Controller->>Tools: getExecutionResult(conversationId)
-        Controller-->>Manager: SSE event "tool-result" (authoritative JSON)
-        Controller->>Manager: emitter.complete()
     end
 
     par background loop, decoupled from the request above
@@ -146,7 +172,7 @@ flowchart LR
     ChatClientNode <-->|"HTTP :11434"| Ollama
     ChatClientNode -->|"tool call (via Spring AOP proxy)"| ToolsNode
     ToolsNode --> Repo
-    Repo -->|"jdbc:postgresql://localhost:54321/wfm_db<br/>INSERT shift_assignments + outbox_events<br/>(atomic on success; NOT atomic on internal-catch failure, see Known Open Gap)"| Postgres
+    Repo -->|"jdbc:postgresql://localhost:54321/wfm_db<br/>INSERT shift_assignments + outbox_events<br/>(atomic on both success and failure - see Exception propagation gap)"| Postgres
     Poller -->|"SELECT ... FOR UPDATE SKIP LOCKED<br/>(within @Transactional method)"| Postgres
     Poller -->|"UPDATE status=PROCESSED"| Postgres
     Poller -->|"produce acks=all<br/>bootstrap-servers=localhost:9094<br/>topic wfm.audit.shifts"| Kafka
