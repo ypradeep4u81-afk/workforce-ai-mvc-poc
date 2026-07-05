@@ -71,12 +71,28 @@ public class WfmSchedulingController {
 
         var heartbeatFuture = heartbeatScheduler.submit(() -> {
             try {
-                while (true) {
+                // Belt-and-suspenders termination check alongside the InterruptedException path
+                // below: today Thread.sleep() always throws first on interrupt (this check never
+                // actually trips), but it keeps the loop self-terminating if the body is ever
+                // restructured to not always be sleeping.
+                while (!Thread.currentThread().isInterrupted()) {
                     Thread.sleep(15_000);
                     emitter.send(SseEmitter.event().comment("ping-heartbeat"));
                 }
-            } catch (InterruptedException | IOException e) {
-                // Connection closed or task finished naturally
+            } catch (InterruptedException | IOException | IllegalStateException e) {
+                // InterruptedException: cancelled via onCompletion/onTimeout/onError below - normal
+                // termination signal, Thread.sleep() throws immediately on interrupt.
+                // IOException: write failed, client already gone.
+                // IllegalStateException: emitter completed between wake-up and send() (race
+                // with the completion path below) - harmless, task is ending anyway.
+                // All three are expected, normal ways this loop ends - no rethrow, no logging.
+            } catch (Exception e) {
+                // Anything else is unexpected - not one of the three known termination causes
+                // above. A submitted ExecutorService task's exception is otherwise silently
+                // discarded (heartbeatFuture.get() is never called), so without this a genuine
+                // bug here would vanish with no trace. Log only, don't rethrow - the heartbeat
+                // task ends the same way regardless of which catch branch is taken.
+                log.warn("[HEARTBEAT_UNEXPECTED_EXCEPTION] Session: {} -> {}", conversationId, e.toString(), e);
             }
         });
 
