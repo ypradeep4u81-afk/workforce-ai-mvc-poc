@@ -114,7 +114,8 @@ public class WfmSchedulingController {
                         .build();
 
                 chatClient.prompt()
-                        .user(String.format("Prompt: '%s'. Pass this conversationId to the tool exactly: '%s'", prompt, conversationId))
+                        .user(prompt)
+                        .toolContext(Map.of("conversationId", conversationId))
                         .stream()
                         .content()
                         .subscribe(
